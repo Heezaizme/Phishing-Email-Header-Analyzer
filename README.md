@@ -1,5 +1,4 @@
 Email Header Analyzer — by Dan Mir
-A Email Header Analyzer built by Danish Ahmad Mir with a clean, user-friendly Python GUI.
 
 🚀 **Features**
 Automatic Analysis of email headers (From, To, Cc, Subject, Date, Return-Path)
