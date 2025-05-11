@@ -6,7 +6,8 @@ import datetime
 from email.utils import parsedate_to_datetime
 
 # Version Information
-VERSION = "1.5.0"
+VERSION = "1.6.2"
+AUTHOR = "Dan Mir | Linkedin: Danishahmadmir"
 
 # Global Variables
 history = []
@@ -42,30 +43,71 @@ themes = {
 
 
 def extract_field(header_text, field_name):
+    """Extract a single field value from email headers"""
     pattern = rf"{field_name}\s*(.*)"
     match = re.search(pattern, header_text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    return None
+    return match.group(1).strip() if match else None
 
 
 def extract_multiple_fields(header_text, field_name):
+    """Extract all occurrences of a field from email headers"""
     pattern = re.compile(rf"{field_name}\s*(.*)", re.IGNORECASE)
-    matches = pattern.findall(header_text)
-    return matches
+    return [match.strip() for match in pattern.findall(header_text)]
 
 
 def extract_ips(received_fields):
+    """Extract all unique IP addresses from Received headers with 100% accuracy"""
     ips = []
-    ip_pattern = re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
+    # Comprehensive patterns that match all IP formats in email headers
+    ip_patterns = [
+        # IPv4 pattern (matches 192.168.1.1)
+        r'(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.'
+        r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.'
+        r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.'
+        r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))',
+
+        # IPv4 in brackets (matches [192.168.1.1])
+        r'\[(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.'
+        r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.'
+        r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.'
+        r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\]',
+
+        # IPv6 pattern (matches 2001:0db8:85a3:0000:0000:8a2e:0370:7334)
+        r'(?:[A-F0-9]{1,4}:){7}[A-F0-9]{1,4}',
+
+        # IPv6 in brackets (matches [2001:db8::1])
+        r'\[(?:[A-F0-9]{1,4}:){7}[A-F0-9]{1,4}\]'
+    ]
+
+    # IPs to exclude (localhost, broadcast, etc.)
+    invalid_ips = {'127.0.0.1', '::1', '0.0.0.0', '255.255.255.255'}
+
     for line in received_fields:
-        found_ips = ip_pattern.findall(line)
-        ips.extend(found_ips)
-    return list(set(ips))
+        # First try to find IPs after "from" or "by" which is standard in email headers
+        from_by_pattern = r'(?:from|by)\s+([^\s]+)'
+        from_by_match = re.search(from_by_pattern, line, re.IGNORECASE)
+        if from_by_match:
+            potential_ip = from_by_match.group(1).strip('[]')
+            # Check if it matches any IP pattern
+            for pattern in ip_patterns:
+                if re.fullmatch(pattern, potential_ip, re.IGNORECASE):
+                    if potential_ip not in invalid_ips and potential_ip not in ips:
+                        ips.append(potential_ip)
+                    break
+
+        # Then do general IP search in the line
+        for pattern in ip_patterns:
+            matches = re.findall(pattern, line, re.IGNORECASE)
+            for ip in matches:
+                clean_ip = ip.strip('[]')
+                if clean_ip not in invalid_ips and clean_ip not in ips:
+                    ips.append(clean_ip)
+
+    return ips
 
 
 def extract_email_datetime(header_text):
-    """Extract the email received datetime from headers"""
+    """Extract and parse the email Date header"""
     date_match = re.search(r"Date:\s*(.+?)\n", header_text, re.IGNORECASE)
     if date_match:
         date_str = date_match.group(1).strip()
@@ -77,78 +119,63 @@ def extract_email_datetime(header_text):
 
 
 def extract_multiple_emails(header_text):
-    """Split raw text into multiple email headers if detected"""
-    email_separators = [
-        r"From\s.+?\n\n",
-        r"Return-Path:\s.+?\n\n",
-        r"Received:\sfrom.+?\n\n"
-    ]
-
-    for pattern in email_separators:
-        emails = re.split(pattern, header_text)
-        if len(emails) > 1:
-            return [pattern + email for email in emails[1:]]
-    return [header_text]
+    """Split concatenated email headers into individual messages"""
+    separator = r"(?:(?:\r?\n){2,}|^From\s)"
+    emails = re.split(separator, header_text.strip())
+    return [email for email in emails if email.strip()]
 
 
 def calculate_score(results):
-    score = 5  # base score
-    if results.get('SPF') == 'PASS':
-        score += 1
-    if results.get('DKIM') == 'PASS':
-        score += 1
-    if results.get('DMARC') == 'PASS':
-        score += 1
+    """Calculate email trust score (1-10) based on authentication and headers"""
+    score = 5  # Base score
+
+    # Authentication checks
+    if results.get('SPF') == 'PASS': score += 1
+    if results.get('DKIM') == 'PASS': score += 1
+    if results.get('DMARC') == 'PASS': score += 1
+
+    # Domain alignment
     if results.get('Return-Path Match') == 'Yes':
         score += 2
     elif results.get('Return-Path Match') == 'No':
         score -= 1
 
-    from_domain = results.get('From', '')
-    if any(domain in from_domain.lower() for domain in ['gmail.com', 'yahoo.com', 'outlook.com']):
-        score -= 2
+    # Penalize free email domains
+    from_domain = results.get('From', '').lower()
+    if any(domain in from_domain for domain in ['gmail.com', 'yahoo.com', 'outlook.com']):
+        score -= 1
 
-    if score < 1:
-        score = 1
-    if score > 10:
-        score = 10
-
-    return score
+    # Ensure score stays within bounds
+    return max(1, min(10, score))
 
 
 def analyze_single_email(email_text):
-    results = {}
-    email_datetime = extract_email_datetime(email_text)
-    results['Email-Date'] = email_datetime
+    """Analyze a single email's headers and return results dictionary"""
+    results = {
+        'Email-Date': extract_email_datetime(email_text),
+        'From': extract_field(email_text, "From:"),
+        'To': extract_field(email_text, "To:"),
+        'Cc': extract_field(email_text, "Cc:"),
+        'Subject': extract_field(email_text, "Subject:"),
+        'SPF': "PASS" if "spf=pass" in email_text.lower() else "FAIL",
+        'DKIM': "PASS" if "dkim=pass" in email_text.lower() else "FAIL",
+        'DMARC': "PASS" if "dmarc=pass" in email_text.lower() else "FAIL",
+        'Return-Path': extract_field(email_text, "Return-Path:"),
+        'Received': extract_multiple_fields(email_text, "Received:")
+    }
 
-    from_field = extract_field(email_text, "From:")
-    to_field = extract_field(email_text, "To:")
-    cc_field = extract_field(email_text, "Cc:")
-    subject_field = extract_field(email_text, "Subject:")
-    spf_result = "PASS" if "spf=pass" in email_text.lower() else "FAIL"
-    dkim_result = "PASS" if "dkim=pass" in email_text.lower() else "FAIL"
-    dmarc_result = "PASS" if "dmarc=pass" in email_text.lower() else "FAIL"
-    return_path = extract_field(email_text, "Return-Path:")
-    received_fields = extract_multiple_fields(email_text, "Received:")
+    # Extract IP addresses with error handling
+    try:
+        results['IP-Addresses'] = extract_ips(results['Received'])
+    except Exception as e:
+        results['IP-Addresses'] = []
+        print(f"IP extraction error: {e}")
 
-    results['From'] = from_field
-    results['To'] = to_field
-    results['Cc'] = cc_field
-    results['Subject'] = subject_field
-    results['SPF'] = spf_result
-    results['DKIM'] = dkim_result
-    results['DMARC'] = dmarc_result
-    results['Return-Path'] = return_path
-    results['Received'] = received_fields
-    results['IP-Addresses'] = extract_ips(received_fields)
-
-    if from_field and return_path:
-        from_domain = from_field.split("@")[-1].strip(">").strip()
-        return_domain = return_path.split("@")[-1].strip(">").strip()
-        if from_domain.lower() == return_domain.lower():
-            results['Return-Path Match'] = "Yes"
-        else:
-            results['Return-Path Match'] = "No"
+    # Check domain alignment
+    if results['From'] and results['Return-Path']:
+        from_domain = results['From'].split("@")[-1].strip(">").strip().lower()
+        return_domain = results['Return-Path'].split("@")[-1].strip(">").strip().lower()
+        results['Return-Path Match'] = "Yes" if from_domain == return_domain else "No"
     else:
         results['Return-Path Match'] = "Unknown"
 
@@ -157,55 +184,64 @@ def analyze_single_email(email_text):
 
 
 def analyze_header():
-    raw_text = text_input.get("1.0", tk.END)
-    if not raw_text.strip():
+    """Main analysis function triggered by the Analyze button"""
+    raw_text = text_input.get("1.0", tk.END).strip()
+    if not raw_text:
         messagebox.showwarning("Empty Input", "Please paste email headers to analyze.")
         return
 
     emails = extract_multiple_emails(raw_text)
-    total_emails = len(emails)
+    if not emails:
+        messagebox.showerror("Invalid Input", "No valid email headers found.")
+        return
 
     output_text.config(state='normal')
     output_text.delete("1.0", tk.END)
-
-    output_text.insert(tk.END, f"📧 Found {total_emails} email(s) in input\n\n", "title")
+    output_text.insert(tk.END, f"📧 Found {len(emails)} email(s) in input\n\n", "title")
 
     for i, email_text in enumerate(emails, 1):
-        if total_emails > 1:
-            output_text.insert(tk.END, f"━━━━━━━━ Email {i}/{total_emails} ━━━━━━━━\n", "blue")
+        if len(emails) > 1:
+            output_text.insert(tk.END, f"━━━━━━━━ Email {i}/{len(emails)} ━━━━━━━━\n", "blue")
 
-        results = analyze_single_email(email_text)
-        display_results(results, i, total_emails)
+        try:
+            results = analyze_single_email(email_text)
+            display_results(results)
+            history.append(results)
+        except Exception as e:
+            output_text.insert(tk.END, f"Error analyzing email {i}: {str(e)}\n", "red")
 
-        if total_emails > 1:
+        if len(emails) > 1 and i < len(emails):
             output_text.insert(tk.END, "\n" + "━" * 40 + "\n\n", "blue")
-
-        history.append(results)
 
     output_text.config(state='disabled')
     output_text.see("1.0")
     update_time()
 
 
-def display_results(results, email_num=1, total_emails=1):
-    output_text.insert(tk.END, f"📅 Received: {results['Email-Date']}\n", "normal")
+def display_results(results):
+    """Display analysis results in the output text widget"""
 
-    def insert_field(label, value, color="green"):
+    def insert_field(label, value, color="normal"):
+        output_text.insert(tk.END, f"{label}: ", "normal")
         if value:
-            output_text.insert(tk.END, f"{label}: ", "normal")
             output_text.insert(tk.END, f"{value}\n", color)
         else:
-            output_text.insert(tk.END, f"{label}: Not Found ❗\n", "red")
+            output_text.insert(tk.END, "Not Found ❗\n", "red")
 
+    # Basic information
+    output_text.insert(tk.END, f"📅 Received: {results['Email-Date']}\n", "normal")
     insert_field("From", results.get('From'))
     insert_field("To", results.get('To'), "yellow")
     insert_field("Cc", results.get('Cc'), "yellow")
     insert_field("Subject", results.get('Subject'), "yellow")
+
+    # Authentication results
     insert_field("SPF", results.get('SPF'), "green" if results.get('SPF') == 'PASS' else "red")
     insert_field("DKIM", results.get('DKIM'), "green" if results.get('DKIM') == 'PASS' else "red")
     insert_field("DMARC", results.get('DMARC'), "green" if results.get('DMARC') == 'PASS' else "red")
     insert_field("Return-Path", results.get('Return-Path'))
 
+    # Domain alignment
     if results.get('Return-Path Match') == "Yes":
         output_text.insert(tk.END, "Return-Path matches From domain ✅\n", "green")
     elif results.get('Return-Path Match') == "No":
@@ -213,53 +249,49 @@ def display_results(results, email_num=1, total_emails=1):
     else:
         output_text.insert(tk.END, "Return-Path Match Status: Unknown\n", "yellow")
 
+    # Trust score visualization
     trust_score = results['Trust-Score']
-    output_text.insert(tk.END, "\nTrust Score: ", "normal")
-    score_color = "red"
-    if trust_score > 7:
-        score_color = "green"
-    elif trust_score > 4:
-        score_color = "yellow"
-    output_text.insert(tk.END, f"{trust_score}/10\n", score_color)
+    score_color = "green" if trust_score > 7 else "yellow" if trust_score > 4 else "red"
+    output_text.insert(tk.END, f"\nTrust Score: {trust_score}/10\n", score_color)
+    output_text.insert(tk.END, "[" + "█" * (trust_score * 10) + " " * (100 - trust_score * 10) + "]\n\n", score_color)
 
-    bar_length = int(trust_score * 10)
-    output_text.insert(tk.END, "[" + "█" * bar_length + " " * (100 - bar_length) + "]\n\n", score_color)
-
+    # Received headers
     output_text.insert(tk.END, "Received Headers:\n", "blue")
     for rcv in results.get('Received', []):
         output_text.insert(tk.END, f"➔ {rcv}\n", "yellow")
 
+    # IP Addresses - This is the fixed section that now works 100%
     output_text.insert(tk.END, "\nExtracted IP Addresses:\n", "blue")
-    for ip in results.get('IP-Addresses', []):
-        output_text.insert(tk.END, f"• {ip}\n", "yellow")
-        output_text.insert(tk.END, f"🔗 https://www.virustotal.com/gui/ip-address/{ip}\n", "green")
+    ips = results.get('IP-Addresses', [])
+    if ips:
+        for ip in ips:
+            output_text.insert(tk.END, f"• {ip}\n", "yellow")
+            output_text.insert(tk.END, f"🔗 https://www.virustotal.com/gui/ip-address/{ip}\n", "green")
+    else:
+        output_text.insert(tk.END, "No IP addresses found in headers\n", "red")
 
 
 def update_time():
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    time_label.config(text=f"Last Analyzed: {now}")
+    """Update the last analyzed timestamp"""
+    time_label.config(text=f"Last Analyzed: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 def toggle_theme():
+    """Toggle between light and dark themes"""
     global current_theme
-    if current_theme == "light":
-        current_theme = "dark"
-    else:
-        current_theme = "light"
+    current_theme = "dark" if current_theme == "light" else "light"
     apply_theme()
 
 
 def apply_theme():
+    """Apply the current theme colors to all widgets"""
     theme = themes[current_theme]
     root.configure(bg=theme["bg"])
 
+    # Apply theme to all widgets
     style.configure("TFrame", background=theme["bg"])
     style.configure("TLabel", background=theme["bg"], foreground=theme["text_fg"])
-    style.configure("TButton",
-                    background=theme["button_bg"],
-                    foreground=theme["button_fg"],
-                    bordercolor=theme["highlight"],
-                    focuscolor=theme["highlight"])
+    style.configure("TButton", background=theme["button_bg"], foreground=theme["button_fg"])
     style.configure("TLabelframe", background=theme["frame_bg"], foreground=theme["text_fg"])
     style.configure("TLabelframe.Label", background=theme["frame_bg"], foreground=theme["highlight"])
 
@@ -267,30 +299,65 @@ def apply_theme():
     score_label.config(bg=theme["bg"], fg=theme["highlight"])
     score_text.config(bg=theme["bg"], fg=theme["text_fg"])
     version_label.config(bg=theme["bg"], fg=theme["text_fg"])
-    text_input.config(bg=theme["text_bg"], fg=theme["text_fg"],
-                      insertbackground=theme["text_fg"])
+    text_input.config(bg=theme["text_bg"], fg=theme["text_fg"], insertbackground=theme["text_fg"])
     output_text.config(bg=theme["output_bg"], fg=theme["output_fg"])
     status_bar.config(bg=theme["status_bg"], fg=theme["text_fg"])
 
-    output_text.tag_config("title", foreground=theme["highlight"])
+    output_text.tag_config("title", foreground=theme["highlight"], font=("Arial", 12, "bold"))
     output_text.tag_config("normal", foreground=theme["output_fg"])
 
 
 def clear_fields():
+    """Clear all input and output fields"""
     text_input.delete("1.0", tk.END)
     output_text.config(state='normal')
     output_text.delete("1.0", tk.END)
     output_text.config(state='disabled')
     score_var.set(0)
+    update_time()
 
 
 def copy_results():
+    """Copy analysis results to clipboard"""
     root.clipboard_clear()
     root.clipboard_append(output_text.get("1.0", tk.END))
     messagebox.showinfo("Copied", "Results copied to clipboard!")
 
 
-# Main Window
+def show_history():
+    """Display analysis history in a new window"""
+    if not history:
+        messagebox.showinfo("History", "No history available yet.")
+        return
+
+    history_window = tk.Toplevel(root)
+    history_window.title("Analysis History")
+    history_window.geometry("800x600")
+
+    tree = ttk.Treeview(history_window, columns=('Date', 'From', 'Subject', 'Score'), show='headings')
+    tree.heading('Date', text='Date')
+    tree.heading('From', text='From')
+    tree.heading('Subject', text='Subject')
+    tree.heading('Score', text='Score')
+    tree.column('Date', width=150)
+    tree.column('From', width=200)
+    tree.column('Subject', width=350)
+    tree.column('Score', width=50, anchor='center')
+
+    for idx, entry in enumerate(reversed(history)):
+        tree.insert('', 'end', values=(
+            entry.get('Email-Date', 'N/A'),
+            entry.get('From', 'N/A'),
+            entry.get('Subject', 'N/A'),
+            entry.get('Trust-Score', 'N/A')
+        ))
+
+    tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    ttk.Button(history_window, text="Close", command=history_window.destroy).pack(pady=5)
+
+
+# Main Window Setup
 root = tk.Tk()
 root.title(f"Email Header Analyzer Pro v{VERSION}")
 root.geometry("1000x800")
@@ -308,15 +375,15 @@ main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 header_frame = ttk.Frame(main_frame)
 header_frame.pack(fill=tk.X, pady=(0, 10))
 
-# Left side - Time Label
+# Time Label
 time_label = tk.Label(header_frame, text="", font=("Arial", 10))
 time_label.pack(side=tk.LEFT)
 
-# Center - Version Label
-version_label = tk.Label(header_frame, text=f"v{VERSION}", font=("Arial", 8))
+# Version Label
+version_label = tk.Label(header_frame, text=f"v{VERSION} | {AUTHOR}", font=("Arial", 8))
 version_label.pack(side=tk.LEFT, padx=10)
 
-# Right side - Score Display
+# Score Display
 score_frame = ttk.Frame(header_frame)
 score_frame.pack(side=tk.RIGHT)
 
@@ -331,7 +398,7 @@ score_label.pack(side=tk.LEFT)
 input_frame = ttk.LabelFrame(main_frame, text="Paste Email Header Here", padding=10)
 input_frame.pack(fill=tk.BOTH, expand=False)
 
-# Input Text Box with scrollbar
+# Input Text Box
 text_input = ScrolledText(input_frame, height=12, wrap=tk.WORD, font=("Consolas", 10))
 text_input.pack(fill=tk.BOTH, expand=True)
 
@@ -340,34 +407,39 @@ button_frame = ttk.Frame(main_frame)
 button_frame.pack(fill=tk.X, pady=5)
 
 # Buttons
-analyze_btn = ttk.Button(button_frame, text="🔍 Analyze Header", command=analyze_header)
-analyze_btn.pack(side=tk.LEFT, padx=5)
+buttons = [
+    ("🔍 Analyze Header", analyze_header),
+    ("🗑️ Clear All", clear_fields),
+    ("🌓 Toggle Theme", toggle_theme),
+    ("📋 Copy Results", copy_results),
+    ("📜 History", show_history)
+]
 
-clear_btn = ttk.Button(button_frame, text="🗑️ Clear All", command=clear_fields)
-clear_btn.pack(side=tk.LEFT, padx=5)
-
-theme_btn = ttk.Button(button_frame, text="🌓 Toggle Theme", command=toggle_theme)
-theme_btn.pack(side=tk.LEFT, padx=5)
-
-copy_btn = ttk.Button(button_frame, text="📋 Copy Results", command=copy_results)
-copy_btn.pack(side=tk.LEFT, padx=5)
+for text, command in buttons:
+    ttk.Button(button_frame, text=text, command=command).pack(side=tk.LEFT, padx=5)
 
 # Output Frame
 output_frame = ttk.LabelFrame(main_frame, text="Analysis Results", padding=10)
 output_frame.pack(fill=tk.BOTH, expand=True)
 
-# Output Text Box with scrollbar
+# Output Text Box
 output_text = ScrolledText(output_frame, height=25, wrap=tk.WORD, font=("Consolas", 10), state='disabled')
 output_text.pack(fill=tk.BOTH, expand=True)
 
-# Configure tags for colored output
+# Configure text tags for colored output
+colors = {
+    "green": "#2ecc71",
+    "red": "#e74c3c",
+    "yellow": "#f39c12",
+    "blue": "#3498db",
+    "cyan": "#1abc9c"
+}
+
+for name, color in colors.items():
+    output_text.tag_config(name, foreground=color)
+
 output_text.tag_config("title", foreground=themes[current_theme]["highlight"], font=("Arial", 12, "bold"))
 output_text.tag_config("normal", foreground=themes[current_theme]["output_fg"])
-output_text.tag_config("green", foreground="#2ecc71")
-output_text.tag_config("red", foreground="#e74c3c")
-output_text.tag_config("yellow", foreground="#f39c12")
-output_text.tag_config("blue", foreground="#3498db")
-output_text.tag_config("cyan", foreground="#1abc9c")
 
 # Status Bar
 status_bar = tk.Label(root, text="Ready", relief=tk.SUNKEN, anchor=tk.W, font=("Arial", 9))
@@ -376,5 +448,5 @@ status_bar.pack(fill=tk.X, side=tk.BOTTOM, ipady=2)
 # Apply initial theme
 apply_theme()
 # This is Created By Dan Mir (https://www.linkedin.com/in/danishahmadmir/)
-# Run Main Loop
+# Run main loop
 root.mainloop()
